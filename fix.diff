@@ -1,0 +1,37 @@
+--- a/server.ts
++++ b/server.ts
+@@ -996,12 +996,13 @@
+ // returned, and polling stopped permanently while the process stayed alive
+ // (MCP stdin keeps it running). Outbound tools kept working but the bot was
+ // deaf to inbound messages until a full restart.
++let startedAt = 0
+ void (async () => {
+   for (let attempt = 1; ; attempt++) {
+     try {
+       await bot.start({
+         onStart: info => {
+-          attempt = 0
++          startedAt = Date.now()
+           botUsername = info.username
+           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+           void bot.api.setMyCommands(
+@@ -1019,6 +1020,19 @@
+       if (shuttingDown) return
+       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
+       if (err instanceof Error && err.message === 'Aborted delay') return
++      // bot.start() leaves its polling loop running when it rejects. Restarting
++      // without stopping stacks a second long-poll on the same token, and the
++      // two race: Telegram 409s one, the survivor acks updates the handlers
++      // never see. That is a self-inflicted 409 storm — the bot goes deaf with
++      // no competitor anywhere. Always tear the old loop down before retrying.
++      await bot.stop().catch(() => {})
++
++      // Only a run that actually polled for a while earns a fresh backoff.
++      // Resetting on onStart made every 409 retry instantly (delay = 0) and put
++      // the 8-attempt bailout below permanently out of reach.
++      if (startedAt && Date.now() - startedAt > 30_000) attempt = 1
++      startedAt = 0
++
+       const is409 = err instanceof GrammyError && err.error_code === 409
+       if (is409 && attempt >= 8) {
+         process.stderr.write(
