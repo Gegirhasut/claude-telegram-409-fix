@@ -126,13 +126,38 @@ Verified with `tsc --noEmit --strict` against `grammy@1.44.0`.
 
 I didn't open this as a PR because the repo auto-closes external PRs — happy to send one if a maintainer would rather have it that way.
 
+## Second failure mode: an orphaned poller spins on EPIPE and survives SIGTERM
+
+This is a **separate bug** from the stacking above, but the two feed each other. I hit it in the wild while verifying the patch.
+
+When a session dies, its poller can be left orphaned — reparented to init, with its stdout/stderr pipe closed. From then on, every `process.stderr.write` in the plugin throws `EPIPE`. The uncaught-exception handler reports that error by writing it **to the same broken pipe**, which throws `EPIPE` again, which it reports again. It never terminates.
+
+Measured on a real orphan before I killed it:
+
+- **~74,000 failed `write()` calls in 5 seconds** — every single `write` syscall erroring.
+- **~157,000 `telegram channel: uncaught exception: Error: EPIPE: broken pipe, write` messages in 30 seconds.**
+- **One CPU core pegged at ~92% for 30 minutes**, until I reaped it by hand.
+- **Zero connections to `api.telegram.org`** — it was far too busy failing to write to do any actual polling.
+
+**It is immune to SIGTERM.** The shutdown handler ([`server.ts:652`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L652)) writes `telegram channel: shutting down` to stderr *before* it calls `bot.stop()`. On an orphan that write throws `EPIPE`, so the signal handler dies on its first line and never reaches the stop or the `process.exit(0)`. I confirmed this: I sent `SIGTERM`, the process survived. Only `SIGKILL` cleared it.
+
+**This is what arms the 409.** The stale-holder reaper at [`server.ts:56-69`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L56-L69) sends `SIGTERM` to the previous poller and then proceeds to start polling, **assuming the old process died**. Against an orphan in the EPIPE loop, it didn't. So a fresh session begins polling while a live orphan still holds the token — which is precisely the conflict that produces the `409` the retry loop then mishandles. Bug two creates the condition; bug one turns it into a permanent outage.
+
+Suggested fixes, all independent of the patch above:
+
+- **Guard every stderr write.** Swallow `EPIPE` (or check `process.stderr.writable` first). A logger that can throw — and whose error path logs — is a loop waiting to happen. This alone defuses the spin.
+- **Stop the bot before logging in the shutdown path.** Call `bot.stop()` first, log after, so a dead pipe can't prevent a clean exit.
+- **Make the reaper verify the kill.** After `SIGTERM`, poll for the pid actually being gone and escalate to `SIGKILL` after a short timeout, instead of assuming `SIGTERM` worked.
+
 ## Separate ask: surface a persistent 409 in `/mcp`
 
 This failure is invisible by construction. The sole signal is a `process.stderr.write` to a pipe nothing reads, while the channel goes on advertising **connected · 4 tools** despite being deaf.
 
-A repeated 409 — or any state in which the poller is not actually consuming updates — should surface in the `/mcp` panel and degrade the channel's reported status, rather than being reported as healthy. As it stands, the only way to discover this is to notice that people's messages are silently not arriving, which can take days.
+**I have now watched the channel report "connected · 4 tools" while deaf for two entirely independent reasons** — the stacked-poller 409 storm, and the orphaned EPIPE spin above. Two different root causes, the same silent, healthy-looking status. That is the strongest argument that the reporting itself is the bug: whatever is fixed underneath, the next cause will be just as quiet.
 
-That is worth fixing independently of the patch above: the patch removes *this* cause of a deaf channel, but any future one will be just as silent.
+A poller that is **not actually consuming updates must not report healthy.** A repeated 409, an exited polling loop, zero connections to the Bot API — any of these should surface in the `/mcp` panel and degrade the channel's reported status. As it stands, the only way to discover any of them is to notice that people's messages are silently not arriving, which can take days.
+
+That is worth fixing independently of the patch above: the patch removes *two* causes of a deaf channel, but a status that cannot distinguish "polling" from "not polling" will hide the third.
 
 A smaller, related point: the startup handoff (SIGTERM the old poller, then immediately begin polling) races Telegram's in-flight long-poll *by design*. Even with this patch it costs a retry cycle on every restart. Waiting for the previous poller to exit — or treating the first 409 after startup as expected — would make the handoff clean.
 
