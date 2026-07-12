@@ -60,7 +60,7 @@ permanently unreachable, because `attempt` is zeroed again on every restart befo
 
 Once entered, the state never recovers.
 
-### How to prove there is no external competitor
+### Why you cannot prove who holds the token
 
 Freeze the poller (`SIGSTOP` — reversible, not a kill), wait for Telegram's in-flight long-poll to
 expire, then ask Telegram once whether anyone else holds the token. Passing no `offset` acks nothing,
