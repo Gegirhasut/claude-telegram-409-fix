@@ -70,11 +70,16 @@ so this drops no messages:
 kill -STOP "$(cat ~/.claude/channels/telegram/bot.pid)"
 sleep 60
 curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates?timeout=0"
-#  => 200 {"ok":true,"result":[]}    no 409  =>  nothing else is polling
+#  => 200 {"ok":true,"result":[]}    no 409 -- but this does NOT prove nothing else is polling
 kill -CONT "$(cat ~/.claude/channels/telegram/bot.pid)"
 ```
 
-If no 409 appears while your own poller is frozen, then every 409 it reports is its own.
+A clean result here is **not** proof that no competitor exists. `bot.pid` names only the newest
+poller, so an orphaned one keeps polling right through the probe; and a remote or intermittent
+consumer can simply be idle at the instant you sample. `pending_update_count` is 0 either way.
+
+There is also no Bot API call that evicts another `getUpdates` consumer — if the holder is not a
+process you can reach, revoking the token in BotFather is the only way to break its grip.
 
 ## The fix
 

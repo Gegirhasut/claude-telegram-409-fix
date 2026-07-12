@@ -2,9 +2,11 @@
 
 The Telegram channel goes permanently deaf after a session restart. It reports **connected · 4 tools**, outbound replies still send and return a `message_id`, but **no inbound message ever reaches a session again** for the life of that process.
 
-The cause is self-inflicted. The polling retry loop stacks a second `getUpdates` long-poll on the same bot token, and the two race until Telegram 409s one of them. There is no competing consumer anywhere — the process races **its own** previous polling loop.
+The bugs below are about how the plugin **reacts** to a `409 Conflict`, and they hold regardless of what caused the first one. Whatever the trigger, the retry loop stacks a second `getUpdates` long-poll on the same token, the two race, and Telegram 409s one of them — so the plugin ends up manufacturing conflicts on top of the one it was trying to recover from, and **the survivor acks updates whose handlers never run**.
 
-This is **deterministic**, not intermittent. It reproduces on every session restart.
+The channel reports **connected · 4 tools** throughout, for three independent reasons (a bailout that `return`s instead of exiting, a poller that never logs again once bailed out, and a `pending_update_count` of 0 that looks identical to health).
+
+The reproduction below is **deterministic** — restart during an open long-poll and it happens every time.
 
 | | |
 |---|---|
@@ -49,21 +51,36 @@ It also makes the "409 persists after 8 attempts — Exiting" bailout at [`serve
 
 Once entered, the state is self-perpetuating and never recovers.
 
-## Proof that no external competitor exists
+## Why a 409 is hard to attribute
 
-The natural reading of a 409 is "another poller holds the token" — the plugin's own error message says exactly that. It is worth ruling out.
+The natural reading of a 409 is "another poller holds the token" — the plugin's own error message says exactly that, and it names a *local* stray process. In practice an operator **cannot tell** who is holding the token, and the tools that look like they would settle it do not.
 
-Freeze the poller (`SIGSTOP` — reversible, not a kill), wait for Telegram's in-flight long-poll to expire, then ask Telegram once whether anything else holds the token. No `offset` is passed, so this acknowledges nothing and drops no messages:
+The obvious probe is to freeze the poller (`SIGSTOP` — reversible, not a kill), let Telegram's in-flight long-poll expire, and ask once whether anything else is consuming. No `offset` is passed, so it acks nothing and drops no messages:
 
 ```bash
 kill -STOP "$(cat ~/.claude/channels/telegram/bot.pid)"
 sleep 60
 curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates?timeout=0"
-#  => 200 {"ok":true,"result":[]}     no 409  =>  nothing else is polling
+#  => 200 {"ok":true,"result":[]}     no 409  -- but this does NOT mean "nothing else is polling"
 kill -CONT "$(cat ~/.claude/channels/telegram/bot.pid)"
 ```
 
-No 409 while the plugin's own poller is frozen ⇒ every 409 it reports is its own.
+I ran exactly this and it came back clean. It was not conclusive, for two reasons:
+
+- **It freezes the wrong set of processes.** `bot.pid` names only the *newest* poller. An orphaned poller — see the EPIPE/SIGTERM failure mode below — is by definition not the pid in that file, so the probe leaves it running and polling.
+- **A remote or intermittent consumer can be idle at probe time.** A one-shot `getUpdates` samples a single instant. A poller that is between long-polls, backing off, or spinning on an error returns no 409 for that sample and resumes afterwards.
+
+`getWebhookInfo` does not break the tie either: `pending_update_count` is **0** whether the bot is perfectly healthy or being silently drained by a competing consumer (see below).
+
+**In my own case I could not determine who held the token.** The probe was clean; the channel was still deaf; `/revoke` in BotFather is what finally restored it — and a revoke invalidates the token for *every* holder, local or remote, so it identifies nobody. A local orphan and a second host are equally consistent with everything I observed.
+
+That ambiguity is not a footnote — it is part of the bug. The plugin's error message asserts a local stray process, which sent me hunting locally; had the holder in fact been remote, no amount of local hunting could have found it. **And it argues for the patch rather than against it:** since an operator cannot establish who caused the first 409, the plugin must not respond to one by manufacturing more.
+
+### There is no remote kill switch except `/revoke`
+
+Worth stating explicitly, because it is not obvious: **the Bot API offers no call that evicts another `getUpdates` consumer.** `deleteWebhook`, `close`, `logOut` do not do it. If the holder is not a process you can reach, revoking the token in BotFather is the *only* way to break its grip — at the cost of invalidating it everywhere, including for you.
+
+That belongs in the plugin's own error message. Today it names only causes you could kill locally — "stray `bun server.ts` process or a second session" — and stops there. If the holder is in fact somewhere you cannot reach, that message sends you hunting for a process that does not exist on your machine, and never mentions the one thing that would end it.
 
 ## Why `pending_update_count: 0` misleads
 
@@ -73,10 +90,11 @@ That reads as "nothing is stuck." It means the opposite: **something is draining
 
 ## Patch
 
-Two changes, both inside the retry loop:
+Three changes, all inside the retry loop:
 
-- **Call `bot.stop()` before every retry of `bot.start()`**, so the old poll loop is torn down instead of left running and stacked on. (Uses the plugin's existing `Promise.resolve(bot.stop())` idiom from `server.ts:659`; grammy types `stop()` as `Promise<void>`.)
-- **Don't reset `attempt` in `onStart`.** Track when polling actually started, and only refresh the backoff budget after a run that genuinely polled for 30s+. Keeping `attempt >= 1` floors the backoff at 1s and makes the 8-attempt bailout reachable — so a *real* external conflict now fails loudly instead of spinning forever.
+- **Call `bot.stop()` before every retry of `bot.start()`**, so the old poll loop is torn down instead of left running and stacked on. (grammy types `stop()` as `Promise<void>`.)
+- **Don't reset `attempt` in `onStart`.** Track when polling actually started, and only refresh the backoff budget after a run that genuinely polled for 30s+. Keeping `attempt >= 1` floors the backoff at 1s and makes the 8-attempt bailout reachable — so a conflict that really is someone else's now fails loudly instead of spinning forever.
+- **`process.exit(1)` at the bailout instead of `return`.** A bare `return` left a live pid with zero Telegram sockets — a deaf zombie still reporting **connected · 4 tools**. Exiting makes the failure visible in `/mcp` and restartable.
 
 ```diff
 --- a/external_plugins/telegram/server.ts
@@ -96,30 +114,46 @@ Two changes, both inside the retry loop:
            botUsername = info.username
            process.stderr.write(`telegram channel: polling as @${info.username}\n`)
            void bot.api.setMyCommands(
-@@ -1019,6 +1020,18 @@ void (async () => {
+@@ -1019,13 +1020,32 @@ void (async () => {
        if (shuttingDown) return
        // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
        if (err instanceof Error && err.message === 'Aborted delay') return
-+      // grammy leaves its polling loop running when start() rejects. Retrying without
-+      // stopping stacks a second getUpdates long-poll on the same token: Telegram allows
-+      // one consumer, so it 409s one of them, and the survivor acks updates whose handlers
-+      // never run. The bot goes deaf with no competing process anywhere — the 409s are its
-+      // own. Tear the old loop down before retrying.
-+      await Promise.resolve(bot.stop()).catch(() => {})
-+      // Only a run that actually polled for a while earns a fresh backoff budget. Resetting
-+      // in onStart (which fires before getUpdates can 409) made every retry immediate —
-+      // delay = 1000 * 0 — and put the bailout below permanently out of reach. Keeping
-+      // attempt >= 1 also floors the backoff at 1s.
++      // bot.start() leaves its polling loop running when it rejects. Restarting
++      // without stopping stacks a second long-poll on the same token, and the
++      // two race: Telegram 409s one, the survivor acks updates the handlers
++      // never see. Whatever caused the first 409, retrying this way manufactures
++      // more of them. Always tear the old loop down before retrying.
++      await bot.stop().catch(() => {})
++
++      // Only a run that actually polled for a while earns a fresh backoff.
++      // Resetting on onStart made every 409 retry instantly (delay = 0) and put
++      // the 8-attempt bailout below permanently out of reach.
 +      if (startedAt && Date.now() - startedAt > 30_000) attempt = 1
 +      startedAt = 0
++
        const is409 = err instanceof GrammyError && err.error_code === 409
        if (is409 && attempt >= 8) {
          process.stderr.write(
+           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
+-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
++          `another poller is holding the bot token (stray 'bun server.ts' process, a second session, ` +
++          `or the same token deployed on another host). Exiting.\n`,
+         )
+-        return
++        // `return` here only exited the retry loop. MCP stdin keeps the process alive, so the
++        // result was a live pid with zero Telegram sockets: outbound tools still worked, inbound
++        // was stone deaf, and nothing was logged ever again — a bailed-out poller is silent, so
++        // "quiet" reads as healthy. Exit for real: a dead MCP server is visible in /mcp and can
++        // be restarted; a deaf zombie holding stdin cannot be told from a working channel.
++        process.exit(1)
+       }
+       const delay = Math.min(1000 * attempt, 15000)
+       const detail = is409
 ```
 
-**Ready to cherry-pick**, based on `e14e8fe` — one commit, `server.ts` only, 14 insertions / 1 deletion:
+**Ready to cherry-pick**, based on `e14e8fe` — one commit, `server.ts` only, 23 insertions / 3 deletions:
 
-- Commit: https://github.com/Gegirhasut/claude-plugins-official/commit/d6f73c2156a9e15f72ad1a19255a2c8136fba481
+- Commit: https://github.com/Gegirhasut/claude-plugins-official/commit/1f618b6291f49bc579fb0c3d0783d93dbeccef63
 - Diff vs `main`: https://github.com/anthropics/claude-plugins-official/compare/main...Gegirhasut:claude-plugins-official:fix/telegram-409-poller-stacking
 
 Verified with `tsc --noEmit --strict` against `grammy@1.44.0`.

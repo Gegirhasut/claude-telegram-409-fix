@@ -1,6 +1,8 @@
---- a/server.ts
-+++ b/server.ts
-@@ -996,12 +996,13 @@
+diff --git a/external_plugins/telegram/server.ts b/external_plugins/telegram/server.ts
+index 23a21b0..d5cd880 100644
+--- a/external_plugins/telegram/server.ts
++++ b/external_plugins/telegram/server.ts
+@@ -996,12 +996,13 @@ bot.catch(err => {
  // returned, and polling stopped permanently while the process stayed alive
  // (MCP stdin keeps it running). Outbound tools kept working but the bot was
  // deaf to inbound messages until a full restart.
@@ -15,15 +17,15 @@
            botUsername = info.username
            process.stderr.write(`telegram channel: polling as @${info.username}\n`)
            void bot.api.setMyCommands(
-@@ -1019,13 +1020,32 @@
+@@ -1019,13 +1020,32 @@ void (async () => {
        if (shuttingDown) return
        // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
        if (err instanceof Error && err.message === 'Aborted delay') return
 +      // bot.start() leaves its polling loop running when it rejects. Restarting
 +      // without stopping stacks a second long-poll on the same token, and the
 +      // two race: Telegram 409s one, the survivor acks updates the handlers
-+      // never see. That is a self-inflicted 409 storm — the bot goes deaf with
-+      // no competitor anywhere. Always tear the old loop down before retrying.
++      // never see. Whatever caused the first 409, retrying this way manufactures
++      // more of them. Always tear the old loop down before retrying.
 +      await bot.stop().catch(() => {})
 +
 +      // Only a run that actually polled for a while earns a fresh backoff.
