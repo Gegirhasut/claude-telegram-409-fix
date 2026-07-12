@@ -17,8 +17,11 @@ FIX_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PLUGIN_ROOT="${HOME}/.claude/plugins/cache/claude-plugins-official/telegram"
 PATCH="$FIX_DIR/fix.diff"
 
-# Fixed: the retry path tears the old polling loop down before restarting it.
-FIXED_MARKER='bot.stop().catch'
+# Fixed: the retry path tears the old polling loop down before restarting it. Matches both
+# shapes -- this repo's patch (`bot.stop().catch`) and the form proposed upstream, which wraps
+# it in the plugin's own house idiom (`Promise.resolve(bot.stop()).catch`). Either one means
+# the poller is stopped before a retry, so there is nothing to do.
+FIXED_MARKER='bot\.stop\(\)\)?\.catch'
 # Buggy: onStart zeroes the retry counter before the 409 throws => backoff 0, bailout unreachable.
 BUG_MARKER='attempt = 0'
 
@@ -34,7 +37,7 @@ VERSION="$(ls -1 "$PLUGIN_ROOT" 2>/dev/null | sort -V | tail -1)"
 SERVER="$PLUGIN_ROOT/$VERSION/server.ts"
 [ -f "$SERVER" ] || { ok "telegram-fix: $VERSION has no server.ts - nothing to do"; exit 0; }
 
-has_fix=0; grep -qF "$FIXED_MARKER" "$SERVER" && has_fix=1
+has_fix=0; grep -qE "$FIXED_MARKER" "$SERVER" && has_fix=1
 has_bug=0; grep -qF "$BUG_MARKER"   "$SERVER" && has_bug=1
 
 # Already safe: the retry stops the bot, and the backoff counter is not zeroed.

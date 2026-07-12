@@ -27,6 +27,10 @@ fi
 
 # Advisory: never block the launch on a preflight failure — a broken channel is
 # worse than annoying, but an un-launchable claude is worse still.
-"$FIX_DIR/preflight.sh" || true
+#
+# TG_FIX_QUIET silences the "all good" line: on a normal launch this must be
+# invisible. A wiped patch still prints loudly (warn/red ignore TG_FIX_QUIET),
+# which is the only case worth interrupting for. Unset it to confirm it ran.
+TG_FIX_QUIET=1 "$FIX_DIR/preflight.sh" || true
 
 exec "$REAL_CLAUDE" "$@"
