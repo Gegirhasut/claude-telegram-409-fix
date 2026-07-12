@@ -1,47 +1,26 @@
-**Title:** Telegram channel is permanently deaf after a session restart — the poller stacks a second `getUpdates` loop and 409-storms itself, silently
+## Summary
 
----
+The Telegram channel goes permanently deaf after a session restart. It reports **connected · 4 tools**, outbound replies still send and return a `message_id`, but **no inbound message ever reaches a session again** for the life of that process.
 
-### Environment
+The cause is self-inflicted. The polling retry loop stacks a second `getUpdates` long-poll on the same bot token, and the two race until Telegram 409s one of them. There is no competing consumer anywhere — the process races **its own** previous polling loop.
+
+This is **deterministic**, not intermittent. It reproduces on every session restart.
 
 | | |
 |---|---|
-| Plugin | `claude-plugins-official/telegram` **0.0.6** |
+| Plugin | `external_plugins/telegram` **0.0.6** |
 | Claude Code | 2.1.207 |
 | Runtime | bun 1.3.14 |
-| OS | Ubuntu (Linux) |
 | Transport | long polling (no webhook — `getWebhookInfo` → `"url": ""`) |
 
-### Symptom
-
-After a Claude Code session restart, the Telegram channel reports **connected · 4 tools** and
-**outbound works** — a reply sends successfully and returns a `message_id`. But **inbound is silently
-dead**:
-
-- DMs show "delivered" in the Telegram app and never reach any session.
-- `getWebhookInfo` → `pending_update_count: 0`.
-- Nothing surfaces in the UI, the `/mcp` panel, or any log file.
-
-The zero pending count is actively misleading. It reads as "nothing is stuck", but it means the
-opposite: **something is draining the update queue**. Updates are fetched and discarded before any
-handler runs.
-
-The loss is visible in Telegram's message ids, which are per-chat and sequential: the last id a
-session received was *N*, and a reply sent afterwards was assigned *N+11* — ten messages existed in
-that chat and reached nobody.
-
-This is **deterministic**, not intermittent. It recurs on every session restart.
-
-### Reproduction
+## Reproduction
 
 1. Run a session with the Telegram channel over long polling.
-2. Restart Claude Code. The new `server.ts` SIGTERMs the previous poller (`server.ts:56–68`) and
-   starts polling **immediately**, while Telegram still holds the previous `getUpdates` long-poll
-   open for ~30–50s.
+2. Restart Claude Code **while Telegram still holds the previous session's `getUpdates` long-poll open** (it stays open ~30–50s). The new process SIGTERMs the previous poller ([`server.ts:56-69`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L56-L69)) and begins polling immediately, without waiting for that long-poll to drain.
 3. The new poller takes a `409 Conflict`.
-4. The channel never receives another message for the life of the session.
+4. The channel never receives another message.
 
-The only trace is a stderr write on a pipe nothing reads:
+The only trace is a `process.stderr.write` on a pipe nothing reads:
 
 ```
 telegram channel: polling as @<bot>
@@ -50,32 +29,31 @@ telegram channel: polling as @<bot>
 telegram channel: 409 Conflict, retrying in 0s      # forever, ~9 per 30s
 ```
 
-### Root cause
+The message loss is measurable. Telegram's message ids are per-chat and sequential: the last id a session received was *N*, and a reply sent afterwards was assigned *N+11* — ten messages existed in that chat and reached nobody.
 
-Two bugs in the polling retry loop (`server.ts`, lines 999–1036) compound into a **self-inflicted**
-409 storm. There is no competing consumer anywhere — the process races **its own** previous polling
-loop over the single bot token.
+## Root cause
+
+Two bugs in the polling retry loop ([`server.ts:999-1038`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L999-L1038)) compound.
 
 **1. `bot.start()` is retried without `bot.stop()`.**
-grammY leaves its polling loop running when `start()` rejects. The retry at `server.ts:1002` stacks a
-*second* long-poll on the same token. Telegram permits exactly one `getUpdates` consumer, so it 409s
-one of them — and **the survivor acks updates whose handlers never run**. That is where the messages
-go. Confirmed at the socket level: the single plugin process holds **two** ESTABLISHED connections to
-`api.telegram.org`, both with growing byte counters.
 
-**2. `onStart` resets `attempt = 0` (`server.ts:1004`) *before* the 409 throws.**
-The backoff at `server.ts:1030` is `Math.min(1000 * attempt, 15000)`, which therefore evaluates to
-**0 ms** — a hot retry loop with no delay. It also makes the "409 persists after 8 attempts —
-Exiting" bailout at **`server.ts:1023`** permanently unreachable, since `attempt` is zeroed again on
-every restart before the next throw.
+grammy leaves its polling loop running when `start()` rejects. The retry at [`server.ts:1002`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L1002) stacks a *second* long-poll on the same token. Telegram permits exactly one `getUpdates` consumer, so it 409s one of them — and **the survivor acks updates whose handlers never run**. That is where the messages go.
+
+Confirmed at the socket level: the single plugin process holds **two** ESTABLISHED connections to `api.telegram.org`, both with growing byte counters.
+
+**2. `onStart` resets `attempt = 0` ([`server.ts:1004`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L1004)) before the 409 can throw.**
+
+`onStart` fires when polling *begins* — i.e. before `getUpdates` returns the 409. So by the time the error is caught, `attempt` is already back to 0, and the backoff at [`server.ts:1030`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L1030) — `Math.min(1000 * attempt, 15000)` — evaluates to **0 ms**. A hot retry loop with no delay.
+
+It also makes the "409 persists after 8 attempts — Exiting" bailout at [`server.ts:1023`](https://github.com/anthropics/claude-plugins-official/blob/e14e8fe2c1fca5912d7389ba7e3a44149d36b5c8/external_plugins/telegram/server.ts#L1023) permanently unreachable, since `attempt` is zeroed again on every restart before the next throw.
 
 Once entered, the state is self-perpetuating and never recovers.
 
-### Proof that no external competitor exists
+## Proof that no external competitor exists
 
-Freeze the poller (`SIGSTOP` — reversible, not a kill), wait for Telegram's in-flight long-poll to
-expire, then ask Telegram once whether anything else holds the token. No `offset` is passed, so this
-acknowledges nothing and drops no messages:
+The natural reading of a 409 is "another poller holds the token" — the plugin's own error message says exactly that. It is worth ruling out.
+
+Freeze the poller (`SIGSTOP` — reversible, not a kill), wait for Telegram's in-flight long-poll to expire, then ask Telegram once whether anything else holds the token. No `offset` is passed, so this acknowledges nothing and drops no messages:
 
 ```bash
 kill -STOP "$(cat ~/.claude/channels/telegram/bot.pid)"
@@ -87,12 +65,23 @@ kill -CONT "$(cat ~/.claude/channels/telegram/bot.pid)"
 
 No 409 while the plugin's own poller is frozen ⇒ every 409 it reports is its own.
 
-### Proposed patch
+## Why `pending_update_count: 0` misleads
+
+While the channel is deaf, `getWebhookInfo` reports `pending_update_count: 0`.
+
+That reads as "nothing is stuck." It means the opposite: **something is draining the queue.** Updates are being fetched and acked by the stacked poller, then discarded before any handler runs. A zero pending count is exactly what you would see from a perfectly healthy bot *and* from this failure — so the one metric an operator would reach for cannot distinguish them. That is a large part of why this is hard to see from the outside.
+
+## Patch
+
+Two changes, both inside the retry loop:
+
+- **Call `bot.stop()` before every retry of `bot.start()`**, so the old poll loop is torn down instead of left running and stacked on. (Uses the plugin's existing `Promise.resolve(bot.stop())` idiom from `server.ts:659`; grammy types `stop()` as `Promise<void>`.)
+- **Don't reset `attempt` in `onStart`.** Track when polling actually started, and only refresh the backoff budget after a run that genuinely polled for 30s+. Keeping `attempt >= 1` floors the backoff at 1s and makes the 8-attempt bailout reachable — so a *real* external conflict now fails loudly instead of spinning forever.
 
 ```diff
---- a/server.ts
-+++ b/server.ts
-@@ -996,12 +996,13 @@
+--- a/external_plugins/telegram/server.ts
++++ b/external_plugins/telegram/server.ts
+@@ -996,12 +996,13 @@ bot.catch(err => {
  // returned, and polling stopped permanently while the process stayed alive
  // (MCP stdin keeps it running). Outbound tools kept working but the bot was
  // deaf to inbound messages until a full restart.
@@ -107,45 +96,48 @@ No 409 while the plugin's own poller is frozen ⇒ every 409 it reports is its o
            botUsername = info.username
            process.stderr.write(`telegram channel: polling as @${info.username}\n`)
            void bot.api.setMyCommands(
-@@ -1019,6 +1020,19 @@
+@@ -1019,6 +1020,18 @@ void (async () => {
        if (shuttingDown) return
        // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
        if (err instanceof Error && err.message === 'Aborted delay') return
-+      // bot.start() leaves its polling loop running when it rejects. Restarting
-+      // without stopping stacks a second long-poll on the same token, and the
-+      // two race: Telegram 409s one, the survivor acks updates the handlers
-+      // never see. That is a self-inflicted 409 storm — the bot goes deaf with
-+      // no competitor anywhere. Always tear the old loop down before retrying.
-+      await bot.stop().catch(() => {})
-+
-+      // Only a run that actually polled for a while earns a fresh backoff.
-+      // Resetting on onStart made every 409 retry instantly (delay = 0) and put
-+      // the 8-attempt bailout below permanently out of reach.
++      // grammy leaves its polling loop running when start() rejects. Retrying without
++      // stopping stacks a second getUpdates long-poll on the same token: Telegram allows
++      // one consumer, so it 409s one of them, and the survivor acks updates whose handlers
++      // never run. The bot goes deaf with no competing process anywhere — the 409s are its
++      // own. Tear the old loop down before retrying.
++      await Promise.resolve(bot.stop()).catch(() => {})
++      // Only a run that actually polled for a while earns a fresh backoff budget. Resetting
++      // in onStart (which fires before getUpdates can 409) made every retry immediate —
++      // delay = 1000 * 0 — and put the bailout below permanently out of reach. Keeping
++      // attempt >= 1 also floors the backoff at 1s.
 +      if (startedAt && Date.now() - startedAt > 30_000) attempt = 1
 +      startedAt = 0
-+
        const is409 = err instanceof GrammyError && err.error_code === 409
        if (is409 && attempt >= 8) {
          process.stderr.write(
 ```
 
-With this applied, the retry tears the old loop down first (nothing stacks), the backoff floors at
-1s, and a *genuine* conflict reaches the bailout and fails loudly instead of spinning forever.
+**Ready to cherry-pick**, based on `e14e8fe` — one commit, `server.ts` only, 14 insertions / 1 deletion:
 
-### Please also make the failure non-silent
+- Commit: https://github.com/Gegirhasut/claude-plugins-official/commit/d6f73c2156a9e15f72ad1a19255a2c8136fba481
+- Diff vs `main`: https://github.com/anthropics/claude-plugins-official/compare/main...Gegirhasut:claude-plugins-official:fix/telegram-409-poller-stacking
 
-This is invisible by construction: the sole signal is `process.stderr.write(...)` to a pipe nothing
-reads, while the channel continues to advertise **connected · 4 tools** despite being deaf. A
-repeated 409 — or any state in which the poller is not actually consuming updates — should surface
-in the `/mcp` panel and degrade the channel's reported status, instead of being reported as healthy.
+Verified with `tsc --noEmit --strict` against `grammy@1.44.0`.
 
-A smaller, related suggestion: the startup handoff (SIGTERM the old poller, then immediately begin
-polling) races Telegram's in-flight long-poll by design. Even with the patch it costs a retry cycle
-on every restart. Waiting for the previous poller to exit — or treating the first 409 after startup
-as expected — would make the handoff clean.
+I didn't open this as a PR because the repo auto-closes external PRs — happy to send one if a maintainer would rather have it that way.
 
----
+## Separate ask: surface a persistent 409 in `/mcp`
 
-Full write-up, the patch, and an idempotent preflight script that re-applies it after a plugin
-update (the plugin lives in a cache directory, so updates wipe local fixes):
+This failure is invisible by construction. The sole signal is a `process.stderr.write` to a pipe nothing reads, while the channel goes on advertising **connected · 4 tools** despite being deaf.
+
+A repeated 409 — or any state in which the poller is not actually consuming updates — should surface in the `/mcp` panel and degrade the channel's reported status, rather than being reported as healthy. As it stands, the only way to discover this is to notice that people's messages are silently not arriving, which can take days.
+
+That is worth fixing independently of the patch above: the patch removes *this* cause of a deaf channel, but any future one will be just as silent.
+
+A smaller, related point: the startup handoff (SIGTERM the old poller, then immediately begin polling) races Telegram's in-flight long-poll *by design*. Even with this patch it costs a retry cycle on every restart. Waiting for the previous poller to exit — or treating the first 409 after startup as expected — would make the handoff clean.
+
+## Workaround for anyone hitting this now
+
+Write-up, the patch, and an idempotent preflight script that re-applies it after a plugin update (the plugin lives in a cache directory, so an update silently wipes local fixes):
+
 https://github.com/Gegirhasut/claude-telegram-409-fix
