@@ -19,6 +19,22 @@ fi
 echo "poller pid $PID:"
 ps -p "$PID" -o pid,ppid,etime,cmd | tail -1
 
+BAD=0
+
+# bot.pid only ever names the NEWEST poller: each start overwrites it. An orphan from a dead
+# session -- whose parent claude is gone, so nothing reaps it -- stays invisible to a check that
+# trusts the pid file. Enumerate every poller on the box instead.
+echo
+echo "== 0. orphaned pollers (bot.pid names only the newest) =="
+ALL="$(pgrep -f 'bun server\.ts' | tr '\n' ' ')"
+echo "   poller pids: ${ALL:-none}"
+for p in $ALL; do
+  [ "$p" = "$PID" ] && continue
+  echo "   -> ORPHAN $p ($(ps -o etime= -p "$p" | tr -d ' ') old, $(ps -o pcpu= -p "$p" | tr -d ' ')% cpu) — a second poller on one token. BAD."
+  BAD=1
+done
+[ "$BAD" -eq 0 ] && echo "   -> no orphans: OK"
+
 echo
 echo "== 1. connections to the Telegram Bot API =="
 CONNS="$(ss -tnp 2>/dev/null | grep -c "pid=$PID," || true)"
@@ -27,8 +43,10 @@ if [ "$CONNS" -eq 1 ]; then
   echo "   -> 1 connection: OK (no stacked poller)"
 elif [ "$CONNS" -eq 0 ]; then
   echo "   -> 0 connections: the poller is NOT polling. BAD."
+  BAD=1
 else
   echo "   -> $CONNS connections: STACKED POLLERS — the 409 bug is live. BAD."
+  BAD=1
 fi
 
 echo
@@ -46,7 +64,20 @@ if printf '%s' "$OUT" | grep -q '409'; then
   echo "   -> 409 Conflict present: the channel is DEAF. Run preflight.sh and restart."
   exit 1
 fi
-echo
 echo "   -> zero 409: OK"
+
+# An orphan whose parent died has no stdout/stderr left. The plugin's error handler writes the
+# error to that dead pipe, which throws EPIPE, which it writes again -- a hot loop that pegs a
+# core and makes the process deaf to SIGTERM (its shutdown handler writes to stderr first, so
+# the handler itself dies). Only SIGKILL clears it.
+if printf '%s' "$OUT" | grep -q 'EPIPE'; then
+  echo "   -> EPIPE storm: this poller is orphaned and spinning. SIGTERM will NOT clear it; use kill -9. BAD."
+  BAD=1
+fi
+
 echo
-echo "Now send a DM to the bot and confirm it appears in the session."
+if [ "$BAD" -ne 0 ]; then
+  echo "RESULT: the channel is NOT healthy — see the BAD lines above."
+  exit 1
+fi
+echo "RESULT: healthy. Now send a DM to the bot and confirm it appears in the session."
