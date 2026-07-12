@@ -2,8 +2,13 @@
 # Post-restart verification that the Telegram channel is genuinely healthy.
 # Run this in a session started AFTER the patch was applied.
 #
-#   1. exactly ONE connection to api.telegram.org  (two => the stacking bug is live)
-#   2. ZERO "409 Conflict" lines over 90s
+#   1. exactly ONE poller PROCESS          (two => stacked pollers, the 409 bug is live)
+#   2. AT LEAST ONE socket to api.telegram.org  (zero => alive but deaf, however quiet it is)
+#   3. ZERO "409 Conflict" lines over 90s
+#
+# Do NOT infer stacking from a socket count: bun's keep-alive pool holds several connections per
+# process, and an earlier version of this script failed a healthy channel for having two. Stacking
+# is counted in processes; sockets only tell you whether the one poller is attached to anything.
 #
 # Needs sudo for strace (ptrace_scope). Reads no secrets, prints no token.
 set -uo pipefail
@@ -36,21 +41,41 @@ done
 [ "$BAD" -eq 0 ] && echo "   -> no orphans: OK"
 
 echo
-echo "== 1. connections to the Telegram Bot API =="
-CONNS="$(ss -tnp 2>/dev/null | grep -c "pid=$PID," || true)"
-ss -tnp 2>/dev/null | grep "pid=$PID," | awk '{print "   " $5}'
-if [ "$CONNS" -eq 1 ]; then
-  echo "   -> 1 connection: OK (no stacked poller)"
-elif [ "$CONNS" -eq 0 ]; then
-  echo "   -> 0 connections: the poller is NOT polling. BAD."
-  BAD=1
+echo "== 1. poller PROCESSES (one token, one poller) =="
+NPOLL="$(pgrep -f 'bun server\.ts' | wc -l | tr -d ' ')"
+if [ "$NPOLL" -eq 1 ]; then
+  echo "   -> 1 poller process: OK (no stacking)"
 else
-  echo "   -> $CONNS connections: STACKED POLLERS — the 409 bug is live. BAD."
+  echo "   -> $NPOLL poller processes: STACKED POLLERS — the 409 bug is live. BAD."
+  BAD=1
+fi
+
+# Counting SOCKETS to infer stacking is wrong, and it cost an hour: bun's fetch keep-alive pool
+# legitimately holds more than one connection per process, so ">1 socket" failed a HEALTHY channel.
+# Stacking is a property of PROCESSES (check 1). What a socket count is actually good for is the
+# opposite failure -- a poller that is ALIVE but attached to NOTHING. When the retry loop gave up
+# (8x 409) it returned without exiting and MCP stdin kept the process alive: live pid, zero Telegram
+# sockets, outbound tools fine, inbound stone deaf, and never another line of stderr. Silence is that
+# bug's SIGNATURE, so check 3's "quiet == healthy" blesses it. Zero sockets = DEAF, full stop.
+echo
+echo "== 2. is the poller ATTACHED to Telegram? (zero sockets = deaf, however quiet) =="
+TG_RE="$(getent ahostsv4 api.telegram.org 2>/dev/null | awk '{print $1}' | sort -u \
+         | sed 's/\./\\./g' | paste -sd'|' -)"
+[ -z "$TG_RE" ] && TG_RE='149\.154\.'
+ss -tnp 2>/dev/null | grep "pid=$PID," | grep -E "$TG_RE" | awk '{print "   " $5}'
+SOCKS="$(ss -tnp 2>/dev/null | grep "pid=$PID," | grep -cE "$TG_RE" || true)"
+if [ "$SOCKS" -ge 1 ]; then
+  echo "   -> $SOCKS connection(s) to api.telegram.org: OK (attached and polling)"
+else
+  echo "   -> ZERO connections to api.telegram.org: the poller is ALIVE but DEAF. BAD."
+  echo "      The retry loop gave up and returned without exiting, or the token is held elsewhere."
+  echo "      Check stderr for '409 Conflict persists'; a token held by another HOST will not show"
+  echo "      up as a local orphan in check 0. curl getUpdates by hand: a 409 names the competitor."
   BAD=1
 fi
 
 echo
-echo "== 2. 90s stderr watch (expect: one 'polling as', zero 409) =="
+echo "== 3. 90s stderr watch (expect: one 'polling as', zero 409) =="
 OUT="$(sudo timeout 90 strace -f -qq -s300 -e trace=write -p "$PID" 2>&1 \
         | grep -oE '"telegram channel[^"]*"' | sort | uniq -c)"
 if [ -z "$OUT" ]; then

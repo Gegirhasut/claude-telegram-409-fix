@@ -149,11 +149,35 @@ Suggested fixes, all independent of the patch above:
 - **Stop the bot before logging in the shutdown path.** Call `bot.stop()` first, log after, so a dead pipe can't prevent a clean exit.
 - **Make the reaper verify the kill.** After `SIGTERM`, poll for the pid actually being gone and escalate to `SIGKILL` after a short timeout, instead of assuming `SIGTERM` worked.
 
+### The 8-attempt bailout `return`s instead of exiting — leaving a deaf zombie that looks healthy
+
+The retry loop's give-up branch says `Exiting.` and then does not exit:
+
+```ts
+if (is409 && attempt >= 8) {
+  process.stderr.write(`telegram channel: 409 Conflict persists after ${attempt} attempts — ...  Exiting.\n`)
+  return   // ← leaves the LOOP. Nothing calls process.exit. MCP stdin keeps the process alive.
+}
+```
+
+`return` exits the async IIFE, not the process. The MCP server keeps holding stdin, so the plugin lives on in a state that is worse than a crash:
+
+- **live pid, zero sockets to `api.telegram.org`** — it is not polling and never will again;
+- **outbound tools keep working** — `reply`, `react`, `edit_message` all succeed, so the channel feels alive from the agent's side;
+- **inbound is stone deaf** — `/start` and `/status` get no answer, which is the tell: those are handled before any allowlist check, so silence there rules out an auth drop and points at the transport;
+- **it never logs again.** A bailed-out poller is silent *by construction*. Silence is this bug's signature, which means every "no errors in the log" check reads it as healthy. My own verification script passed this exact state for an hour.
+
+`/mcp` reports **connected · 4 tools** throughout. That is now the **third** independent cause I have watched produce a healthy-looking deaf channel, which I think settles the argument in the section below.
+
+**Fix:** `process.exit(1)`. A dead MCP server is visible in `/mcp` and can be restarted; a zombie holding stdin cannot be told apart from a working channel. If the loop has genuinely given up, the process has no reason to exist.
+
+**Also broaden the message.** It attributes the 409 to a `stray 'bun server.ts' process or a second session` — both *local*. In my case the competitor was the same bot token deployed on **another host entirely**, and that wording sent me hunting for a local orphan that did not exist. Local checks (`pgrep`, orphan sweeps) cannot see a remote holder; only `curl`ing `getUpdates` by hand and reading the 409 does. Suggest: `…(a stray poller, a second session, or the same token running on another host)`.
+
 ## Separate ask: surface a persistent 409 in `/mcp`
 
 This failure is invisible by construction. The sole signal is a `process.stderr.write` to a pipe nothing reads, while the channel goes on advertising **connected · 4 tools** despite being deaf.
 
-**I have now watched the channel report "connected · 4 tools" while deaf for two entirely independent reasons** — the stacked-poller 409 storm, and the orphaned EPIPE spin above. Two different root causes, the same silent, healthy-looking status. That is the strongest argument that the reporting itself is the bug: whatever is fixed underneath, the next cause will be just as quiet.
+**I have now watched the channel report "connected · 4 tools" while deaf for three entirely independent reasons** — the stacked-poller 409 storm, the orphaned EPIPE spin above, and the bailed-out retry loop that `return`s without exiting. Three different root causes, the same silent, healthy-looking status. That is the strongest argument that the reporting itself is the bug: whatever is fixed underneath, the next cause will be just as quiet.
 
 A poller that is **not actually consuming updates must not report healthy.** A repeated 409, an exited polling loop, zero connections to the Bot API — any of these should surface in the `/mcp` panel and degrade the channel's reported status. As it stands, the only way to discover any of them is to notice that people's messages are silently not arriving, which can take days.
 
