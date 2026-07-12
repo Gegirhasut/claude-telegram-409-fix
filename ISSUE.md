@@ -148,4 +148,4 @@ as expected — would make the handoff clean.
 
 Full write-up, the patch, and an idempotent preflight script that re-applies it after a plugin
 update (the plugin lives in a cache directory, so updates wipe local fixes):
-https://github.com/OWNER/claude-telegram-409-fix
+https://github.com/Gegirhasut/claude-telegram-409-fix
